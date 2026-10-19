@@ -1,0 +1,11 @@
+# dsh-agentmemory bundle patch: contributes the provider row into the host
+# composition when this package is installed.
+#
+# HOST-PLANE: the plugin subscribes to every session's `session/event` stream
+# (to prefetch recall and to sync finished turns), registers the three memory
+# tools on the global tool surface, and adds one system-prompt section. It must
+# land in the host composition, never inside an agent preset.
+
+- insert:
+    - id: agentmemory
+      name: 'dsh-agentmemory'

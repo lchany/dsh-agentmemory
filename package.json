@@ -1,0 +1,49 @@
+{
+  "name": "dsh-agentmemory",
+  "version": "0.1.0",
+  "description": "AgentMemory provider for DeepSeek Harness: recall prefetch, turn sync, and the memory_recall/save/search tools",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "agentmemory"
+  ],
+  "license": "MIT",
+  "author": "dsh-agentmemory contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_GITHUB_USER/dsh-agentmemory.git"
+  },
+  "homepage": "https://github.com/YOUR_GITHUB_USER/dsh-agentmemory#readme",
+  "bugs": {
+    "url": "https://github.com/YOUR_GITHUB_USER/dsh-agentmemory/issues"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "COMPATIBILITY.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test test/",
+    "check": "node scripts/check.js"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
