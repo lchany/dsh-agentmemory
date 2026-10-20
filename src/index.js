@@ -211,10 +211,7 @@ function apply (ctx, config = {}) {
         starting: false,
         lastUserText: '',
         lastAssistantText: '',
-        lastQuery: '',
         inFlight: false,
-        compressing: false,
-        injected: new Set(),
       }
       states.set(session, state)
     }
@@ -349,54 +346,27 @@ function apply (ctx, config = {}) {
     state.lastAssistantText = ''
   }
 
-  // ── recall injection ────────────────────────────────────────────────────
+  // ── recall (prefetch) ───────────────────────────────────────────────────
   //
-  // Hermes appends the recall to the user message's API copy before the first
-  // request (`agent/turn_context.py:119`). DSH has no request-rewrite hook, so
-  // the closest equivalent is `agent.inject()` — model-facing context queued for
-  // the next pre-step. When it lands after the first step, the model still sees
-  // it in the same turn; that timing difference is the one honest deviation.
-  const injectRecall = (session, state, text) => {
-    if (text === '' || state.injected.has(text)) return
-    state.injected.add(text)
-    const message = {
-      id: randomUUID(),
-      role: 'user',
-      content: [{ type: 'text', text }],
-      source: { kind: 'agentmemory', form: 'recall' },
-    }
-    let agent = null
-    try {
-      const registry = ctx.agents !== undefined && ctx.agents !== null
-        ? ctx.agents
-        : (typeof ctx.get === 'function' ? ctx.get('agents') : undefined)
-      if (registry !== undefined && registry !== null && typeof registry.get === 'function') agent = registry.get(state.id) || null
-    } catch { /* no registry */ }
-    try {
-      if (agent !== null && typeof agent.inject === 'function') {
-        agent.inject(message)
-        return
-      }
-      if (session !== null && session !== undefined && typeof session.append === 'function') {
-        session.append('user/message', message)
-      }
-    } catch (error) {
-      logger.warn?.(`[${PLUGIN}] cannot inject recall: ${errorText(error)}`)
-    }
-  }
-
-  const runPrefetch = async (session, state, query) => {
-    if (!active() || settings.prefetchEnabled === false) return
-    if (state.inFlight) return
-    if (query === '' || query === state.lastQuery) return
-    if (util.isTrivialPrompt(query, TRIVIAL_PROMPT_RE)) return
+  // Hermes runs `prefetch_all` synchronously on the turn path and appends the
+  // fenced block to the user message's API copy before the first request
+  // (`agent/turn_context.py:927`, `:119`); a provider that does not answer within
+  // `_EXTERNAL_PREFETCH_TIMEOUT_S` is skipped for that turn
+  // (`memory_manager.py:545-552`). DSH has no request-rewrite seam
+  // (`agent/request` "cannot mutate messages"), but `agent/pre-step` may append
+  // logged messages to the batch it is about to commit, so the recall is fetched
+  // there and enters the same request as the prompt. It cannot be started from
+  // the `user/message` event: the loop commits the batch only AFTER pre-step.
+  const fetchRecall = async (state, query) => {
+    if (!active() || settings.prefetchEnabled === false) return ''
+    if (state.inFlight) return ''
+    if (query === '') return ''
+    if (util.isTrivialPrompt(query, TRIVIAL_PROMPT_RE)) return ''
     const resolved = endpoint()
-    if (resolved.valid !== true) return
-    state.lastQuery = query
+    if (resolved.valid !== true) return ''
     state.inFlight = true
     try {
       warnOnce()
-      await startSession(state)
       const result = await prefetch.prefetchRecall({
         endpoint: resolved,
         project: projectFor(state.cwd),
@@ -407,66 +377,79 @@ function apply (ctx, config = {}) {
       })
       if (result.error !== undefined) {
         logger.warn?.(`[${PLUGIN}] recall failed: ${result.error}`)
-        return
+        return ''
       }
-      const block = prefetch.buildMemoryContextBlock(result.text)
-      if (block !== '') injectRecall(session, state, block)
+      return prefetch.buildMemoryContextBlock(result.text)
     } catch (error) {
       logger.warn?.(`[${PLUGIN}] recall crashed: ${errorText(error)}`)
+      return ''
     } finally {
       state.inFlight = false
     }
   }
 
-  // ── pre-compress recall (on_pre_compress) ───────────────────────────────
-  //
-  // Hermes' `on_pre_compress(messages)` returns `prefetch(query)` and the host
-  // splices that text into the compaction summary prompt (`__init__.py:578`,
-  // `memory_manager.py:340`). DSH exposes the compaction only as durable,
-  // log-only session events: `compaction/start` is appended before
-  // summarization, and the sole related waterfall (`compaction/summary-error`)
-  // is for error recovery, not prompt contribution. The port therefore runs
-  // the same query selection and recall fetch and injects the fenced block via
-  // `agent.inject()`: the model gets the memory at/after compaction instead of
-  // inside the summary prompt.
-  const runPreCompress = async (session, state) => {
-    if (!active() || settings.prefetchEnabled === false || state.compressing) return
-    state.compressing = true
-    try {
-      const messages = typeof session.deriveMessages === 'function' ? session.deriveMessages() : []
-      const parts = []
-      for (const message of messages.slice(-5)) {
-        if (message === null || typeof message !== 'object') continue
-        const text = util.messageText(message)
-        if (typeof text === 'string' && text.trim() !== '') parts.push(text)
-      }
-      // Provider: " ".join(content of the last five messages), then the last
-      // 2000 characters (`__init__.py:579-580`).
-      const query = parts.join(' ').slice(-LIMITS.PREFETCH_QUERY_MAX_CHARS).trim()
-      if (query === '') return
-      const resolved = endpoint()
-      if (resolved.valid !== true) return
-      warnOnce()
-      const result = await prefetch.prefetchRecall({
-        endpoint: resolved,
-        project: projectFor(state.cwd),
-        agentId: agentId(),
-        query,
-        limit: settings.prefetchLimit,
-        timeoutMs: settings.timeoutMs,
-      })
-      if (result.error !== undefined) {
-        logger.warn?.(`[${PLUGIN}] pre-compress recall failed: ${result.error}`)
-        return
-      }
-      const block = prefetch.buildMemoryContextBlock(result.text)
-      if (block !== '') injectRecall(session, state, block)
-    } catch (error) {
-      logger.warn?.(`[${PLUGIN}] pre-compress recall crashed: ${errorText(error)}`)
-    } finally {
-      state.compressing = false
+  /** Resolve with `fetchRecall`'s block, or '' once the cap or the step's abort wins. */
+  const recallWithin = (state, query, signal) => new Promise((resolve) => {
+    let timer = null
+    let onAbort = null
+    const done = (value) => {
+      if (timer !== null) clearTimeout(timer)
+      if (onAbort !== null && signal) signal.removeEventListener('abort', onAbort)
+      resolve(value)
     }
-  }
+    timer = setTimeout(() => done(''), LIMITS.PREFETCH_WAIT_MS)
+    if (typeof timer.unref === 'function') timer.unref()
+    if (signal && typeof signal.addEventListener === 'function') {
+      if (signal.aborted) return done('')
+      onAbort = () => done('')
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+    fetchRecall(state, query).then(done, () => done(''))
+  })
+
+  ctx.effect(() => {
+    const off = ctx.on('agent/pre-step', async (payload, next) => {
+      const decision = await next()
+      try {
+        if (decision === null || typeof decision !== 'object' || decision.kind !== 'enter') return decision
+        const session = payload !== null && typeof payload === 'object' && payload.agent !== null && typeof payload.agent === 'object'
+          ? payload.agent.session
+          : undefined
+        if (session === undefined || session === null) return decision
+        const claimed = Array.isArray(payload.messages) ? payload.messages : []
+        const prompts = claimed.filter((message) => util.isHumanMessage(message))
+        if (prompts.length === 0) return decision
+        const query = util.messageText(prompts[prompts.length - 1])
+        const state = sessionState(session)
+        // Hermes builds delegate/review/curator agents with `skip_memory=True`
+        // (`tools/delegate_tool.py:279`, `agent/background_review.py:915-927`,
+        // `agent/curator.py:1119`): no provider, so no prefetch and no recall.
+        if (state.primary === false) return decision
+        const block = await recallWithin(state, query, payload.signal)
+        if (block === '') return decision
+        return {
+          ...decision,
+          messages: [...decision.messages, {
+            id: randomUUID(),
+            role: 'user',
+            content: [{ type: 'text', text: block }],
+            source: { kind: 'agentmemory', form: 'recall' },
+          }],
+        }
+      } catch (error) {
+        logger.warn?.(`[${PLUGIN}] cannot attach recall: ${errorText(error)}`)
+        return decision
+      }
+    })
+    return () => { try { off() } catch { /* gone */ } }
+  }, `${PLUGIN}: recall at pre-step`)
+
+  // `on_pre_compress` (`__init__.py:578`) has no DSH counterpart by design:
+  // Hermes hands its text to the compressor as `memory_context` and, when the
+  // engine does not accept it, continues without it
+  // (`conversation_compression.py:2965`). `dsh-compaction-basic` exposes only the
+  // log-only `compaction/*` events and the `compaction/summary-error` recovery
+  // waterfall, so there is no prompt seam to contribute to.
 
   // ── lifecycle: on_session_end / on_session_switch ───────────────────────
   //
@@ -573,20 +556,12 @@ function apply (ctx, config = {}) {
       try {
         if (event === null || typeof event !== 'object') return
         const state = sessionState(session)
-        if (event.type === 'compaction/start') {
-          // D5: the closest DSH expression of `on_pre_compress`. The event is
-          // appended before summarization, so recall is fetched while the
-          // compaction is being prepared.
-          void runPreCompress(session, state)
-          return
-        }
         if (event.type === 'user/message') {
           const message = event.data
           if (!util.isHumanMessage(message)) return
           const text = util.messageText(message)
           state.lastUserText = text
           state.lastAssistantText = ''
-          state.injected.clear()
           // on_turn_start bookkeeping (`__init__.py:352-355`) opens the scoped
           // session at a turn boundary before any write. The other half of
           // that hook (per-turn author ContextVar + queued-prefetch cache) has
@@ -595,7 +570,6 @@ function apply (ctx, config = {}) {
           if (state.primary !== false && active() && settings.syncEnabled !== false && settings.writeEnabled !== false) {
             void startSession(state)
           }
-          void runPrefetch(session, state, text)
           return
         }
         if (event.type === 'assistant/message') {

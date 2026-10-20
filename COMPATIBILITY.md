@@ -49,11 +49,11 @@ Every item below can be re-checked locally by opening the cited file and line.
 |---|---|---|
 | D1 | Python → JavaScript | The host is Node; behaviour is matched, not code shape. |
 | D2 | Identity stem defaults to `dsh-` and hashes the DSH home, where the provider uses `hermes-` and the Hermes home | Different harness, different bucket. Set `identityPrefix: "hermes"` and `agentId` to the provider's value to *share* a bucket deliberately. |
-| D3 | Recall reaches the model through `agent.inject()` (queued for the next pre-step) instead of appending to the user message's API copy | DSH exposes no request-rewrite hook. Hermes' `api_content` sidecar exists to keep the transcript clean; `inject` achieves the same visibility split, at the cost of possibly landing after the first step. |
+| D3 | Recall is appended to the batch at `agent/pre-step` as its own logged message (`source.kind: "agentmemory"`, `form: "recall"`) instead of to the user message's API copy | DSH exposes no request-rewrite hook (`agent/request` "cannot mutate messages"), but pre-step may add messages to the batch it commits, so the recall rides the same request as the prompt, as in Hermes (`agent/turn_context.py:119`). It stays in the transcript, where Hermes keeps it only in the API copy. The wait is capped at 8 s (`_EXTERNAL_PREFETCH_TIMEOUT_S`); a timeout skips recall for the turn. |
 | D4 | The identity hash always uses `"local"` for the platform slot | The provider substitutes a platform name only when an author is threaded through; DSH `SessionHeader` carries no author or platform field (only `origin`), so there is nothing to thread. `resolveAgentId` still accepts an author for a host that gains one. |
-| D5 | `on_pre_compress` has no summary-prompt contribution point, so recall is queued with `agent.inject()` when DSH commits `compaction/start` | DSH appends `compaction/*` as log-only session events; the only compaction waterfall (`compaction/summary-error`) runs only on failure. The provider's query (last 5 messages joined with spaces, last 2000 chars) and `prefetch()` are ported verbatim; DSH's `prefetchEnabled` / `prefetchLimit` switches still apply. Hermes consumes the text inside its summary prompt; DSH queues it for the next model step, which the compaction engine's docs explicitly allow. |
+| D5 | `on_pre_compress` is not ported | Hermes passes its text to the compressor as `memory_context` and, when the engine does not accept it, continues without it (`agent/conversation_compression.py:2965`). DSH appends `compaction/*` as log-only session events and the only compaction waterfall (`compaction/summary-error`) runs on failure, so there is no prompt seam. Recall blocks are already in the transcript, so a summary carries them. |
 | D6 | Tool/block gating uses the plugin's own `toolsEnabled` / `systemPromptBlockEnabled` settings | Hermes ties both to the `memory` toolset. DSH toolset names are not exposed to host-plane plugins, so the switches are explicit instead of implicit. |
-| D7 | `writeEnabled` plus DSH's `meta.origin: "subagent"` replace the provider's `agent_context == "primary"` | Host-plane plugins see every session, including subagents. Every write path (`session/start`, `observe`, `remember`/`evolve` tools, `session/end`) is skipped for `origin: "subagent"`; an unset origin counts as primary. The `hermes-evolve/memory-write` event carries no session identity, so mirroring is gated only by `writeEnabled` / `mirrorBuiltinMemory`; `dsh-hermes-evolve` is the only emitter. |
+| D7 | `writeEnabled` plus DSH's `meta.origin: "subagent"` replace the provider's `agent_context == "primary"` | Host-plane plugins see every session, including subagents. Every write path (`session/start`, `observe`, `remember`/`evolve` tools, `session/end`) and the pre-step recall are skipped for `origin: "subagent"` (Hermes builds those agents with `skip_memory=True`); an unset origin counts as primary. The `hermes-evolve/memory-write` event carries no session identity, so mirroring is gated only by `writeEnabled` / `mirrorBuiltinMemory`; `dsh-hermes-evolve` is the only emitter. |
 | D8 | Direct HTTP instead of the MCP bridge | The bridge works (verified: 54 tools, 24 KB of schemas ≈ 8k tokens per request), but a plugin that already runs in-process does not need a second process or the schema payload. |
 | D9 | A mismatched `session/start` response is not cached; the plugin warns once per scoped id and keeps the turn fail-open | Aligned with the provider (`__init__.py:265-268`), which caches the session only when `session.id == scoped`. Nothing is cached for a mismatched answer; the next turn retries `session/start`. (`sync_turn` still sends `observe` with the scoped id, exactly as the provider does after a failed start.) |
 
@@ -62,7 +62,7 @@ Every item below can be re-checked locally by opening the cited file and line.
 - `on_delegation` (mirroring a delegate's transcript into the provider). DSH has no equivalent
   delegation hook on the agent event plane.
 - `on_turn_start`'s author attribution and queued-prefetch cache (`__init__.py:352-355`). DSH
-  sessions have no message author, and DSH recall is event-driven rather than a manually primed
+  sessions have no message author, and DSH recall is fetched at pre-step rather than from a manually primed
   queue; the session bookkeeping that `on_turn_start` also covers is kept on the human-prompt and
   `turn/end` paths.
 - The provider's opt-in plaintext-bearer **refusal** (`AGENTMEMORY_REQUIRE_HTTPS=1`). This plugin
@@ -74,11 +74,11 @@ Everything else in the provider's hook surface is mapped:
 | Provider hook | DSH seam | Status |
 |---|---|---|
 | `on_turn_start` | `session/event` `user/message` + `turn/end` | session open kept; author/cache deliberately skipped |
-| `prefetch` | `session/event` `user/message` (human only) | ported |
+| `prefetch` | `agent/pre-step` (claimed human message) | ported; same request as the prompt (see D3) |
 | `sync_turn` | `session/event` `turn/end` (`reason.kind == "completed"`) | ported |
 | `on_session_end` | `session/disposed`, `agent/disposed`, plugin disposal | ported, idempotent per scoped id |
 | `on_session_switch` | `agent/created` (`startup` / `resume` / `clear` / `compact`) | ported; closes the previous scoped session first |
-| `on_pre_compress` | `session/event` `compaction/start` | ported; delivered via `inject` (see D5) |
+| `on_pre_compress` | none | not ported (see D5) |
 | `on_memory_write` | `hermes-evolve/memory-write` | ported (`src/mirror.js`) |
 | `shutdown` | `ctx.effect` cleanup | ported (best-effort `session/end`) |
 

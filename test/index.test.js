@@ -58,6 +58,18 @@ function humanTurn (text) {
   }
 }
 
+/** Drive the `agent/pre-step` waterfall the way the loop does: `next()` yields the claimed batch. */
+async function preStep (host, claimed, { step = 1, signal = new AbortController().signal, decision } = {}) {
+  const handler = host.handlers.get('agent/pre-step')
+  assert.equal(typeof handler, 'function', 'agent/pre-step is subscribed')
+  const base = decision || { kind: 'enter', messages: claimed }
+  return handler({ agent: { session: host.session }, messages: claimed, turn: 1, step, signal }, async () => base)
+}
+
+function userMessage (text, kind = 'user') {
+  return { id: `m-${text}`, role: 'user', content: [{ type: 'text', text }], source: { kind } }
+}
+
 test('apply declares its surface: one prompt section and three tools', async () => {
   const server = await fakeServer(() => ({ status: 200, body: { results: [] } }))
   try {
@@ -74,7 +86,7 @@ test('apply declares its surface: one prompt section and three tools', async () 
   }
 })
 
-test('a human prompt triggers recall and injects the fenced block', async () => {
+test('the first pre-step carries the recall in the same request', async () => {
   const server = await fakeServer((call) => {
     if (call.url === '/agentmemory/smart-search' && call.body.query !== undefined) {
       return { status: 200, body: { results: [{ obsId: 'o1' }] } }
@@ -84,36 +96,149 @@ test('a human prompt triggers recall and injects the fenced block', async () => 
   try {
     const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 'sekret' } }])
     plugin.apply(host.ctx, {})
-    emit(host, humanTurn('how do we deploy?'))
-    await waitFor(() => host.agent.injected.length > 0)
-    const message = host.agent.injected[0]
-    assert.equal(message.role, 'user')
-    assert.equal(message.source.kind, 'agentmemory')
-    assert.match(message.content[0].text, /^<memory-context>\n/)
-    assert.match(message.content[0].text, /- deploy: staging needs the token/)
-    assert.match(message.content[0].text, /<\/memory-context>$/)
-    const recall = server.calls.find((call) => call.url === '/agentmemory/smart-search')
-    assert.equal(recall.authorization, 'Bearer sekret')
-    assert.equal(recall.body.query, 'how do we deploy?')
-    assert.equal(recall.body.includeLessons, false)
-    assert.ok(server.calls.some((call) => call.url === '/agentmemory/session/start'))
+    const prompt = userMessage('how do we deploy?')
+    const decision = await preStep(host, [prompt])
+    assert.equal(decision.kind, 'enter')
+    assert.equal(decision.messages.length, 2)
+    assert.equal(decision.messages[0], prompt, 'the user message is left untouched')
+    const recall = decision.messages[1]
+    assert.equal(recall.role, 'user')
+    assert.equal(recall.source.kind, 'agentmemory')
+    assert.equal(recall.source.form, 'recall')
+    assert.equal(typeof recall.id, 'string')
+    assert.match(recall.content[0].text, /^<memory-context>\n/)
+    assert.match(recall.content[0].text, /- deploy: staging needs the token/)
+    assert.match(recall.content[0].text, /<\/memory-context>$/)
+    const search = server.calls.find((call) => call.url === '/agentmemory/smart-search')
+    assert.equal(search.authorization, 'Bearer sekret')
+    assert.equal(search.body.query, 'how do we deploy?')
+    assert.equal(search.body.includeLessons, false)
+    assert.equal(host.agent.injected.length, 0, 'the recall no longer rides the next-step queue')
   } finally {
     await server.close()
   }
 })
 
-test('trivial prompts and repeated prompts do not recall', async () => {
+test('the user/message event no longer starts the recall (it fires after the first pre-step)', async () => {
   const server = await fakeServer(() => ({ status: 200, body: { results: [] } }))
   try {
     const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 's' } }])
     plugin.apply(host.ctx, {})
-    emit(host, humanTurn('ok'))
-    emit(host, humanTurn('continue'))
+    emit(host, humanTurn('how do we deploy?'))
     await new Promise((resolve) => setTimeout(resolve, 100))
     assert.equal(server.calls.filter((call) => call.url === '/agentmemory/smart-search').length, 0)
     assert.equal(host.agent.injected.length, 0)
   } finally {
     await server.close()
+  }
+})
+
+test('trivial prompts, repeated prompts and context-only batches do not recall', async () => {
+  const server = await fakeServer(() => ({ status: 200, body: { results: [] } }))
+  try {
+    const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 's' } }])
+    plugin.apply(host.ctx, {})
+    for (const text of ['ok', 'continue']) {
+      const decision = await preStep(host, [userMessage(text)])
+      assert.equal(decision.messages.length, 1)
+    }
+    const context = [userMessage('<notice>', 'hermes-evolve')]
+    assert.equal((await preStep(host, context, { step: 2 })).messages.length, 1)
+    assert.equal((await preStep(host, [], { step: 2 })).messages.length, 0)
+    assert.equal(server.calls.filter((call) => call.url === '/agentmemory/smart-search').length, 0)
+  } finally {
+    await server.close()
+  }
+})
+
+test('a repeated prompt recalls again on the next turn; a rejected step passes through untouched', async () => {
+  const server = await fakeServer((call) => {
+    if (call.body.query !== undefined) return { status: 200, body: { results: [{ obsId: 'o1' }] } }
+    return { status: 200, body: { results: [{ observation: { title: 'deploy', narrative: 'staging needs the token' } }] } }
+  })
+  try {
+    const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 's' } }])
+    plugin.apply(host.ctx, {})
+    const prompt = userMessage('how do we deploy?')
+    assert.equal((await preStep(host, [prompt])).messages.length, 2)
+    assert.equal((await preStep(host, [prompt])).messages.length, 2, 'Hermes prefetches every turn, so the same words recall again')
+    const rejected = await preStep(host, [userMessage('another question here')], { decision: { kind: 'reject' } })
+    assert.deepEqual(rejected, { kind: 'reject' })
+    // One recall = a search (carries `query`) plus an expand of the ids it returned.
+    assert.equal(server.calls.filter((call) => call.url === '/agentmemory/smart-search' && call.body.query !== undefined).length, 2)
+  } finally {
+    await server.close()
+  }
+})
+
+test('a subagent session gets no recall: Hermes builds delegate agents with skip_memory=True', async () => {
+  const server = await fakeServer(() => ({ status: 200, body: { results: [{ obsId: 'o1' }] } }))
+  try {
+    const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 's' } }])
+    host.session.header.origin = 'subagent'
+    plugin.apply(host.ctx, {})
+    const decision = await preStep(host, [userMessage('how do we deploy?')])
+    assert.equal(decision.messages.length, 1, 'no recall block is appended for a subagent')
+    assert.equal(server.calls.filter((call) => call.url === '/agentmemory/smart-search').length, 0)
+  } finally {
+    await server.close()
+  }
+})
+
+test('a slow or failing recall never blocks the step: it is skipped for this turn', async () => {
+  const slow = await fakeServer(() => ({ status: 200, body: { results: [] }, delayMs: 800 }))
+  try {
+    const host = makeHost([{ ns: 'agentmemory', value: { url: slow.url, secret: 's', prefetchTimeoutMs: 150 } }])
+    plugin.apply(host.ctx, {})
+    const started = Date.now()
+    const decision = await preStep(host, [userMessage('how do we deploy?')])
+    assert.equal(decision.messages.length, 1)
+    assert.ok(Date.now() - started < 700, 'bounded by the prefetch timeout')
+    assert.equal(host.agent.injected.length, 0, 'a late answer is dropped, not queued')
+  } finally {
+    await slow.close()
+  }
+  const down = makeHost([{ ns: 'agentmemory', value: { url: 'http://127.0.0.1:1', secret: 's' } }])
+  plugin.apply(down.ctx, {})
+  assert.equal((await preStep(down, [userMessage('how do we deploy?')])).messages.length, 1)
+})
+
+test('a failed recall is retried for the same prompt', async () => {
+  let attempts = 0
+  const server = await fakeServer((call) => {
+    if (call.body !== null && call.body.query !== undefined) {
+      attempts += 1
+      if (attempts === 1) return { status: 500, body: { errors: ['boom'] } }
+      return { status: 200, body: { results: [{ obsId: 'o1' }] } }
+    }
+    return { status: 200, body: { results: [{ observation: { title: 'deploy', narrative: 'staging needs the token' } }] } }
+  })
+  try {
+    const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 's' } }])
+    plugin.apply(host.ctx, {})
+    const prompt = userMessage('how do we deploy?')
+    assert.equal((await preStep(host, [prompt])).messages.length, 1, 'the failed attempt fails open')
+    const retried = await preStep(host, [prompt])
+    assert.equal(retried.messages.length, 2, 'a failure must not lock the prompt out')
+    assert.match(retried.messages[1].content[0].text, /staging needs the token/)
+  } finally {
+    await server.close()
+  }
+})
+
+test('an aborted step stops waiting for the recall', async () => {
+  const slow = await fakeServer(() => ({ status: 200, body: { results: [] }, delayMs: 1500 }))
+  try {
+    const host = makeHost([{ ns: 'agentmemory', value: { url: slow.url, secret: 's', prefetchTimeoutMs: 3000 } }])
+    plugin.apply(host.ctx, {})
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 50)
+    const started = Date.now()
+    const decision = await preStep(host, [userMessage('how do we deploy?')], { signal: controller.signal })
+    assert.equal(decision.messages.length, 1)
+    assert.ok(Date.now() - started < 600)
+  } finally {
+    await slow.close()
   }
 })
 
@@ -383,26 +508,16 @@ test('subagent sessions never start, observe, or save', async () => {
   }
 })
 
-test('compaction/start recalls the last five messages and injects the fenced block', async () => {
-  const server = await fakeServer((call) => {
-    if (call.url.endsWith('/agentmemory/smart-search')) {
-      return { status: 200, body: { results: [{ observation: { title: 'deploy', narrative: 'staging needs the token' } }] } }
-    }
-    return { status: 200, body: { success: true } }
-  })
+test('compaction/start does not trigger a recall (the host exposes no compaction prompt seam)', async () => {
+  const server = await fakeServer(() => ({ status: 200, body: { results: [] } }))
   try {
     const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 's' } }])
     plugin.apply(host.ctx, {})
-    host.session.deriveMessages = () => ['one', 'two', 'three', 'four', 'five', 'six'].map((text) => ({
-      role: 'user',
-      content: [{ type: 'text', text }],
-    }))
+    host.session.deriveMessages = () => [{ role: 'user', content: [{ type: 'text', text: 'one two three' }] }]
     emit(host, { type: 'compaction/start', data: { compactionId: 'c1', turn: 1 } })
-    await waitFor(() => host.agent.injected.length > 0)
-    const recall = server.calls.find((call) => call.url.endsWith('/agentmemory/smart-search'))
-    assert.equal(recall.body.query, 'two three four five six')
-    assert.match(host.agent.injected[0].content[0].text, /^<memory-context>\n/)
-    assert.match(host.agent.injected[0].content[0].text, /- deploy: staging needs the token/)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(server.calls.length, 0)
+    assert.equal(host.agent.injected.length, 0)
   } finally {
     await server.close()
   }

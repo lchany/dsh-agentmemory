@@ -50,6 +50,9 @@ const LIMITS = {
   RECALL_NARRATIVE_CHARS: 1000,
   PREFETCH_TOTAL_CHARS: 6000,
   PREFETCH_QUERY_MAX_CHARS: 2000,
+  // Hermes `_EXTERNAL_PREFETCH_TIMEOUT_S` (`agent/memory_manager.py:34`): the most a
+  // turn waits for an external provider's recall before skipping it.
+  PREFETCH_WAIT_MS: 8000,
   SYNC_USER_CHARS: 500,
   SYNC_ASSISTANT_CHARS: 2000,
   // Tool argument bounds.

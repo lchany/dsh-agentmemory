@@ -17,21 +17,35 @@ verbatim strings, schemas, digests, fence, and error codes are unchanged.
   `startup` / `resume` / `clear` / `compact`: the previous scoped session is closed, then the new one
   opened. Implemented in `src/index.js` (`startSession`, `endScoped`, `endSessionState`, the
   `agentmemory: lifecycle` effect).
-- **Compaction recall** — the provider's `on_pre_compress` body (last five messages joined with
-  spaces, last 2000 chars, `prefetch()` at limit 5) runs when DSH commits `compaction/start`; the
-  fenced block is queued with `agent.inject()`. DSH has no summary-prompt seam (see D5).
 - **Subagent write gating** — sessions whose header carries `origin: "subagent"` never call
   `session/start`, `observe`, `session/end`, or the `remember` / `evolve` tools; the tool envelope
   uses the provider's `read_only_context` error. `writeEnabled` still switches every write path.
 - **Native memory mirroring** — `hermes-evolve/memory-write` rows are mirrored through
   `src/mirror.js` (hash-keyed ownership ledger, evolve-on-replace, warn-once when ownership is not
   established). `mirrorBuiltinMemory` (default `true`) controls the subscription.
-- **Tests** — 51 tests: the two pre-existing failures are fixed, plus coverage for session disposal
+- **Tests** — 57 tests: the two pre-existing failures are fixed, plus coverage for session disposal
   (once), resume/clear switching (end before start), mismatched `session/start` (warn once, retry),
-  subagent read-only behaviour, and compaction recall query construction.
+  subagent read-only behaviour, and the pre-step recall (same-request delivery, skip on timeout or
+  abort, no recall for subagent sessions, retry after a failure, recall on every turn, no recall
+  from `user/message` or `compaction/start`).
 
 ### Changed
 
+- **Recall now enters the same request as the prompt.** It is fetched inside `agent/pre-step` from
+  the claimed human message and appended to the batch the loop is about to commit
+  (`source: {kind: "agentmemory", form: "recall"}`), so the model sees it on the first step. The old
+  path started the search on the `user/message` event, which the loop emits only after pre-step, so it
+  could never land on step 1. The wait is capped at 8 s (Hermes' `_EXTERNAL_PREFETCH_TIMEOUT_S`) and is
+  also bounded by `prefetchTimeoutMs` and the step's abort signal; on timeout or error the turn goes
+  ahead without recall and a late answer is dropped, as in Hermes.
+- **Recall follows Hermes' per-agent gating.** Sessions with `origin: "subagent"` (delegates and
+  review forks, which DSH marks the same way) get no recall, matching `skip_memory=True` in
+  `tools/delegate_tool.py:279`, `agent/background_review.py:915-927` and `agent/curator.py:1119`.
+  A failed prefetch no longer pins the prompt: the next turn asks again, and an identical prompt on
+  a later turn recalls again because Hermes prefetches once per turn.
+- **Removed the `compaction/start` recall (`on_pre_compress` stand-in).** Hermes hands that text to the
+  compressor as `memory_context` and continues without it when the engine does not accept one;
+  `dsh-compaction-basic` has no such parameter (see D5).
 - `agent_context == "primary"` parity now rides on DSH's `meta.origin` (D7) instead of a bare
   `writeEnabled` switch.
 - A mismatched `session/start` response is no longer used or cached: the plugin warns once and stays

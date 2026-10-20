@@ -16,7 +16,7 @@ HTTP API directly, so no stdio server, no 54-tool schema payload, and no extra p
 | Behaviour | When | Effect |
 |---|---|---|
 | **Prompt block** | once per request | `Use memory_recall to retrieve relevant saved context and memory_save to retain durable facts…` |
-| **Recall prefetch** | on each human prompt | `smart-search` → `expandIds` → inject a fenced `<memory-context>` block |
+| **Recall prefetch** | on each human prompt | `smart-search` → `expandIds` → attach a fenced `<memory-context>` block to the same request |
 | **Turn sync** | after a `completed` turn | `observe` the exchange so the server can distill it |
 | **Tools** | always (can be disabled) | `memory_recall`, `memory_save`, `memory_search` |
 

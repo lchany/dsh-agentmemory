@@ -55,8 +55,13 @@ async function fakeServer (handler) {
       const call = { method: req.method, url: req.url, body: parsed, authorization: req.headers.authorization }
       calls.push(call)
       const reply = handler(call) || { status: 200, body: { success: true } }
-      res.writeHead(reply.status, { 'content-type': 'application/json' })
-      res.end(JSON.stringify(reply.body))
+      const send = () => {
+        if (res.writableEnded || res.destroyed) return
+        res.writeHead(reply.status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(reply.body))
+      }
+      if (reply.delayMs > 0) setTimeout(send, reply.delayMs)
+      else send()
     })
   })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
