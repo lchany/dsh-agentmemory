@@ -23,6 +23,7 @@ const FIELD_TYPES = {
   toolsEnabled: 'boolean',
   prefetchEnabled: 'boolean',
   syncEnabled: 'boolean',
+  mirrorBuiltinMemory: 'boolean',
   writeEnabled: 'boolean',
   prefetchLimit: 'number',
   prefetchMaxChars: 'number',

@@ -27,6 +27,7 @@ const DEFAULTS = {
   toolsEnabled: true,
   prefetchEnabled: true,
   syncEnabled: true,
+  mirrorBuiltinMemory: true,
   writeEnabled: true,
 
   // Prefetch bounds — the provider's own numbers.

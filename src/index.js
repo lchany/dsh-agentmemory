@@ -27,6 +27,7 @@ const http = require('./http')
 const identity = require('./identity')
 const tools = require('./tools')
 const prefetch = require('./prefetch')
+const mirror = require('./mirror')
 
 const SETTINGS_NS = 'agentmemory'
 const PLUGIN = 'agentmemory'
@@ -176,6 +177,9 @@ function apply (ctx, config = {}) {
   }
 
   // ── per-session state ───────────────────────────────────────────────────
+  // Scoped session ids this process has opened, so `on_session_end` can close
+  // exactly the ones we started (Hermes: "for each matching scoped session").
+  const startedSessions = new Set()
   const states = new WeakMap()
   function sessionState (session) {
     let state = states.get(session)
@@ -223,6 +227,7 @@ function apply (ctx, config = {}) {
       logger.warn?.(`[${PLUGIN}] session/start failed: ${result.error}`)
       return
     }
+    if (scoped !== '') startedSessions.add(scoped)
     const returned = result.session !== null && typeof result.session === 'object' ? result.session.id : undefined
     if (typeof returned === 'string' && returned !== '' && returned !== scoped) {
       logger.warn?.(`[${PLUGIN}] server returned a different session id (${returned}); writes may land in another bucket`)
@@ -322,6 +327,69 @@ function apply (ctx, config = {}) {
     }
   }
 
+  // ── session end ─────────────────────────────────────────────────────────
+  //
+  // Hermes' `on_session_end` fires "only at real session boundaries, never
+  // per-turn" and posts `session/end` for every scoped session it opened
+  // (`__init__.py:555`). DSH's session log has no session-end event (only
+  // `session/end-seed`), so the real boundary available to a host plugin is
+  // our own disposal — process shutdown or plugin unload. Nothing is sent
+  // per turn: an idle session keeps its provider record open.
+  const endSessions = async () => {
+    if (settings.writeEnabled === false) return
+    const resolved = endpoint()
+    if (resolved.valid !== true) return
+    const ids = [...startedSessions]
+    startedSessions.clear()
+    for (const sessionId of ids) {
+      const result = await http.api(resolved.base, 'session/end', { sessionId }, {
+        secret: resolved.secret,
+        timeoutMs: settings.timeoutMs,
+      })
+      if (result.error !== undefined) logger.warn?.(`[${PLUGIN}] session/end failed: ${result.error}`)
+    }
+  }
+
+  // ── built-in memory mirror (on_memory_write) ────────────────────────────
+  //
+  // hermes-evolve owns the built-in MEMORY.md/USER.md store and announces each
+  // applied operation as `hermes-evolve/memory-write`. Hermes' provider hook is
+  // the same idea one layer down: mirror the write so the provider's recall can
+  // find what the native store learned. Serialised through one promise chain:
+  // two writes racing on the ownership file would drop an id.
+  let mirrorChain = Promise.resolve()
+  const handleMirror = (payload) => {
+    if (!active() || settings.mirrorBuiltinMemory === false || settings.writeEnabled === false) return Promise.resolve()
+    const rows = payload !== null && typeof payload === 'object' && Array.isArray(payload.rows) ? payload.rows : []
+    if (rows.length === 0) return Promise.resolve()
+    const run = async () => {
+      const resolved = endpoint()
+      if (resolved.valid !== true) return
+      warnOnce()
+      for (const row of rows) {
+        const outcome = await mirror.mirrorMemoryWrite(row, {
+          endpoint: resolved,
+          project: projectFor(undefined),
+          agentId: agentId(),
+          home,
+          timeoutMs: settings.timeoutMs,
+          writeEnabled: settings.writeEnabled !== false && active(),
+          warn: (message) => logger.warn?.(message),
+        })
+        if (outcome.status === 'error') logger.warn?.(`[${PLUGIN}] memory mirror: ${outcome.detail || 'failed'}`)
+      }
+    }
+    mirrorChain = mirrorChain.then(run, run).catch((error) => {
+      logger.warn?.(`[${PLUGIN}] memory mirror crashed: ${errorText(error)}`)
+    })
+    return mirrorChain
+  }
+
+  ctx.effect(() => {
+    const off = ctx.on('hermes-evolve/memory-write', (payload) => { void handleMirror(payload) })
+    return () => { try { off() } catch { /* gone */ } }
+  }, `${PLUGIN}: built-in memory mirror`)
+
   // ── session events ──────────────────────────────────────────────────────
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
@@ -368,6 +436,8 @@ function apply (ctx, config = {}) {
     })
     return () => { try { off() } catch { /* gone */ } }
   }, `${PLUGIN}: session events`)
+
+  ctx.effect(() => () => { void endSessions() }, `${PLUGIN}: session end`)
 
 }
 

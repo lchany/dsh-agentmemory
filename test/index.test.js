@@ -2,9 +2,12 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 
 const plugin = require('../src')
-const { fakeServer, waitFor } = require('./helpers')
+const { fakeServer, waitFor, makeTempHome, removeTempHome } = require('./helpers')
 
 const SYSTEM_BLOCK = 'Use memory_recall to retrieve relevant saved context and memory_save to retain durable facts. Memory is scoped to this Hermes profile and author by default.'
 
@@ -166,4 +169,91 @@ test('an unreachable server never breaks the turn', async () => {
   await new Promise((resolve) => setTimeout(resolve, 300))
   assert.equal(host.agent.injected.length, 0)
   assert.ok(host.warnings.some((line) => line.includes('unavailable')) || host.warnings.some((line) => line.includes('observe failed')))
+})
+// ── on_memory_write / on_session_end ─────────────────────────────────────
+//
+// Hermes' provider hooks are the reason these exist: a native memory write is
+// mirrored into the provider (`on_memory_write`), and the scoped sessions this
+// process opened are closed once, at a real boundary (`on_session_end`).
+
+function makeDisposableHost (settingsValue) {
+  const cleanups = []
+  const handlers = new Map()
+  const warnings = []
+  const ctx = {
+    logger: { info () {}, debug () {}, warn (...args) { warnings.push(args.join(' ')) } },
+    settings: { describe: () => settingsValue },
+    systemPrompt: { section: () => () => {} },
+    tools: { schemas: () => [], register: () => () => {} },
+    agents: { get: () => undefined },
+    on: (name, handler) => { handlers.set(name, handler); return () => handlers.delete(name) },
+    effect: (factory) => {
+      const cleanup = factory()
+      if (typeof cleanup === 'function') cleanups.push(cleanup)
+    },
+  }
+  return { ctx, cleanups, handlers, warnings }
+}
+
+test('a mirrored native write reaches the provider', async () => {
+  const server = await fakeServer((call) => {
+    if (call.url.endsWith('/agentmemory/remember')) {
+      return { status: 200, body: { success: true, memory: { id: 'mem_7', content: call.body.content, project: call.body.project, agentId: call.body.agentId } } }
+    }
+    return { status: 200, body: { success: true } }
+  })
+  const previousHome = process.env.DSH_HOME
+  const tempHome = makeTempHome('agentmemory-mirror-')
+  process.env.DSH_HOME = tempHome
+  try {
+    const host = makeDisposableHost([{ ns: 'agentmemory', value: { url: server.url, secret: 'sec' } }])
+    plugin.apply(host.ctx, {})
+    const handler = host.handlers.get('hermes-evolve/memory-write')
+    assert.equal(typeof handler, 'function', 'the mirror subscription exists')
+    handler({ rows: [{ action: 'add', target: 'user', content: 'Prefers terse answers.', previous_content: '' }] })
+    await waitFor(() => server.calls.some((call) => call.url.endsWith('/agentmemory/remember')))
+    const call = server.calls.find((entry) => entry.url.endsWith('/agentmemory/remember'))
+    assert.equal(call.body.content, 'Prefers terse answers.')
+    assert.equal(call.body.type, 'fact')
+    await waitFor(() => fs.existsSync(path.join(process.env.DSH_HOME, 'agentmemory-mirrors.json')))
+  } finally {
+    await server.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    // Guarded: refuses anything outside os.tmpdir(), so an inherited
+    // DSH_HOME (dsh injects it into every shell command) can never be wiped.
+    removeTempHome(tempHome)
+  }
+})
+
+test('disposal closes the sessions this process opened, exactly once', async () => {
+  const server = await fakeServer((call) => {
+    if (call.url.endsWith('/agentmemory/session/start')) {
+      return { status: 200, body: { success: true, session: { id: call.body.sessionId } } }
+    }
+    return { status: 200, body: { success: true } }
+  })
+  const previousHome = process.env.DSH_HOME
+  const tempHome = makeTempHome('agentmemory-end-')
+  process.env.DSH_HOME = tempHome
+  try {
+    const host = makeDisposableHost([{ ns: 'agentmemory', value: { url: server.url, secret: 'sec', prefetchEnabled: false } }])
+    plugin.apply(host.ctx, {})
+    const session = { id: 'sess-end', header: { cwd: '/tmp/project' }, append () {} }
+    const onEvent = host.handlers.get('session/event')
+    onEvent(session, { type: 'user/message', data: { content: [{ type: 'text', text: 'Remember this please.' }], source: { kind: 'user' } } })
+    await waitFor(() => server.calls.some((call) => call.url.endsWith('/agentmemory/session/start')))
+    for (const cleanup of host.cleanups.reverse()) cleanup()
+    await waitFor(() => server.calls.some((call) => call.url.endsWith('/agentmemory/session/end')))
+    const ends = server.calls.filter((call) => call.url.endsWith('/agentmemory/session/end'))
+    assert.equal(ends.length, 1)
+    assert.match(ends[0].body.sessionId, /^dsh-[0-9a-f]{64}$/)
+  } finally {
+    await server.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    // Guarded: refuses anything outside os.tmpdir(), so an inherited
+    // DSH_HOME (dsh injects it into every shell command) can never be wiped.
+    removeTempHome(tempHome)
+  }
 })
