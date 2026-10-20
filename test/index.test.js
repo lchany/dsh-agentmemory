@@ -257,3 +257,153 @@ test('disposal closes the sessions this process opened, exactly once', async () 
     removeTempHome(tempHome)
   }
 })
+
+// ── lifecycle hooks (D5/D7/D9) ────────────────────────────────────────────
+
+const startCalls = (server) => server.calls.filter((call) => call.url.endsWith('/agentmemory/session/start'))
+const settle = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms))
+const endCalls = (server) => server.calls.filter((call) => call.url.endsWith('/agentmemory/session/end'))
+
+function echoSessionStart (call) {
+  if (call.url.endsWith('/agentmemory/session/start')) {
+    return { status: 200, body: { success: true, session: { id: call.body.sessionId } } }
+  }
+  return { status: 200, body: { success: true } }
+}
+
+test('session disposal closes the scoped session once; agent disposal does not repeat it', async () => {
+  const server = await fakeServer(echoSessionStart)
+  const previousHome = process.env.DSH_HOME
+  const tempHome = makeTempHome('agentmemory-disposed-')
+  process.env.DSH_HOME = tempHome
+  try {
+    const host = makeDisposableHost([{ ns: 'agentmemory', value: { url: server.url, secret: 'sec', prefetchEnabled: false } }])
+    plugin.apply(host.ctx, {})
+    const session = { id: 'sess-dispose', header: { cwd: '/tmp/project' }, append () {} }
+    host.handlers.get('session/event')(session, humanTurn('Remember this please.'))
+    await waitFor(() => startCalls(server).length === 1)
+    await settle()
+    host.handlers.get('session/disposed')(session)
+    await waitFor(() => endCalls(server).length === 1)
+    host.handlers.get('agent/disposed')({ agent: { session } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(endCalls(server).length, 1)
+    assert.match(endCalls(server)[0].body.sessionId, /^dsh-[0-9a-f]{64}$/)
+  } finally {
+    await server.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    removeTempHome(tempHome)
+  }
+})
+
+test('a resumed/cleared lifecycle closes the previous scoped session, then opens one', async () => {
+  const server = await fakeServer(echoSessionStart)
+  const previousHome = process.env.DSH_HOME
+  const tempHome = makeTempHome('agentmemory-switch-')
+  process.env.DSH_HOME = tempHome
+  try {
+    const host = makeDisposableHost([{ ns: 'agentmemory', value: { url: server.url, secret: 'sec', prefetchEnabled: false } }])
+    plugin.apply(host.ctx, {})
+    const session = { id: 'sess-switch', header: { cwd: '/tmp/project' }, append () {} }
+    host.handlers.get('session/event')(session, humanTurn('first turn'))
+    await waitFor(() => startCalls(server).length === 1)
+    await settle()
+    host.handlers.get('agent/created')({ agent: { session }, source: 'resume' })
+    await waitFor(() => startCalls(server).length === 2)
+    await waitFor(() => endCalls(server).length === 1)
+    // Hermes' on_session_switch ends the old scoped session before opening the
+    // new one (`__init__.py:565-576`); the scoped id is unchanged for a resume.
+    const endIndex = server.calls.findIndex((call) => call.url.endsWith('/agentmemory/session/end'))
+    const secondStartIndex = server.calls.findIndex((call, index) => index > 0 && call.url.endsWith('/agentmemory/session/start'))
+    assert.ok(endIndex < secondStartIndex, 'session/end precedes the reopened session/start')
+    assert.equal(startCalls(server)[0].body.sessionId, startCalls(server)[1].body.sessionId)
+  } finally {
+    await server.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    removeTempHome(tempHome)
+  }
+})
+
+test('a mismatched session/start is never cached, warns once, and is retried', async () => {
+  const server = await fakeServer((call) => {
+    if (call.url.endsWith('/agentmemory/session/start')) {
+      return { status: 200, body: { success: true, session: { id: 'someone-elses-session' } } }
+    }
+    return { status: 200, body: { success: true } }
+  })
+  const previousHome = process.env.DSH_HOME
+  const tempHome = makeTempHome('agentmemory-mismatch-')
+  process.env.DSH_HOME = tempHome
+  try {
+    const host = makeDisposableHost([{ ns: 'agentmemory', value: { url: server.url, secret: 'sec', prefetchEnabled: false } }])
+    plugin.apply(host.ctx, {})
+    const session = { id: 'sess-mismatch', header: { cwd: '/tmp/project' }, append () {} }
+    const onEvent = host.handlers.get('session/event')
+    onEvent(session, humanTurn('first ask'))
+    await waitFor(() => startCalls(server).length === 1)
+    await settle()
+    onEvent(session, humanTurn('second ask'))
+    await waitFor(() => startCalls(server).length === 2)
+    for (const cleanup of host.cleanups.reverse()) cleanup()
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    // D9: an uncached session is never closed, and the warning is emitted once
+    // even though the start was retried.
+    assert.equal(endCalls(server).length, 0)
+    assert.equal(host.warnings.filter((line) => line.includes('did not confirm')).length, 1)
+  } finally {
+    await server.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    removeTempHome(tempHome)
+  }
+})
+
+test('subagent sessions never start, observe, or save', async () => {
+  const server = await fakeServer(() => ({ status: 200, body: { success: true } }))
+  try {
+    const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 's', prefetchEnabled: false } }])
+    plugin.apply(host.ctx, {})
+    const session = { id: 'sub-1', header: { cwd: '/tmp/project', origin: 'subagent' }, append () {} }
+    const onEvent = host.handlers.get('session/event')
+    onEvent(session, humanTurn('child task'))
+    onEvent(session, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'child done' }] } } })
+    onEvent(session, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    assert.equal(server.calls.length, 0)
+    const save = host.registered.find((definition) => definition.name === 'memory_save')
+    const output = await save.execute({ content: 'nope' }, { agent: { session } })
+    const parsed = JSON.parse(output)
+    assert.equal(parsed.success, false)
+    assert.equal(parsed.errorCode, 'read_only_context')
+    assert.equal(parsed.error, 'AgentMemory writes are disabled outside the primary active session.')
+  } finally {
+    await server.close()
+  }
+})
+
+test('compaction/start recalls the last five messages and injects the fenced block', async () => {
+  const server = await fakeServer((call) => {
+    if (call.url.endsWith('/agentmemory/smart-search')) {
+      return { status: 200, body: { results: [{ observation: { title: 'deploy', narrative: 'staging needs the token' } }] } }
+    }
+    return { status: 200, body: { success: true } }
+  })
+  try {
+    const host = makeHost([{ ns: 'agentmemory', value: { url: server.url, secret: 's' } }])
+    plugin.apply(host.ctx, {})
+    host.session.deriveMessages = () => ['one', 'two', 'three', 'four', 'five', 'six'].map((text) => ({
+      role: 'user',
+      content: [{ type: 'text', text }],
+    }))
+    emit(host, { type: 'compaction/start', data: { compactionId: 'c1', turn: 1 } })
+    await waitFor(() => host.agent.injected.length > 0)
+    const recall = server.calls.find((call) => call.url.endsWith('/agentmemory/smart-search'))
+    assert.equal(recall.body.query, 'two three four five six')
+    assert.match(host.agent.injected[0].content[0].text, /^<memory-context>\n/)
+    assert.match(host.agent.injected[0].content[0].text, /- deploy: staging needs the token/)
+  } finally {
+    await server.close()
+  }
+})

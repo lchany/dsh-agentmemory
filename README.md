@@ -100,6 +100,7 @@ environment, then to the documented default.
 | `toolsEnabled` | `true` | Register the three tools |
 | `prefetchEnabled` | `true` | Recall before the turn |
 | `syncEnabled` | `true` | `observe` after a completed turn |
+| `mirrorBuiltinMemory` | `true` | Mirror `hermes-evolve/memory-write` rows into the provider |
 | `writeEnabled` | `true` | Allow write paths (`session/start`, `observe`, …) |
 | `prefetchLimit` | `5` | Candidates requested from `smart-search` |
 | `prefetchMaxChars` | `6000` | Cap on the recall text |
@@ -148,7 +149,7 @@ confirm that `memory_recall` / `memory_save` / `memory_search` are registered.
 ## Develop
 
 ```bash
-npm test        # 38 tests, no network, no host
+npm test        # 51 tests, no network, no host
 npm run check   # syntax + schema + provenance invariants
 ```
 

@@ -64,6 +64,7 @@ function settingsSchema (S) {
     toolsEnabled: S.boolean().default(DEFAULTS.toolsEnabled).volatile(),
     prefetchEnabled: S.boolean().default(DEFAULTS.prefetchEnabled).volatile(),
     syncEnabled: S.boolean().default(DEFAULTS.syncEnabled).volatile(),
+    mirrorBuiltinMemory: S.boolean().default(DEFAULTS.mirrorBuiltinMemory).volatile(),
     writeEnabled: S.boolean().default(DEFAULTS.writeEnabled).volatile(),
 
     prefetchLimit: S.number().min(1).max(20).default(DEFAULTS.prefetchLimit).volatile(),

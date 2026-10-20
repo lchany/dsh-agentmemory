@@ -148,14 +148,18 @@ function apply (ctx, config = {}) {
     try { return new Set(ctx.tools.schemas().map((schema) => schema.name)) } catch { return new Set() }
   })()
   const toolContext = (exec) => {
-    const cwd = exec !== null && exec !== undefined && exec.agent !== undefined && exec.agent !== null
-      ? sessionState(exec.agent.session).cwd
+    const agent = exec !== null && exec !== undefined && exec.agent !== undefined ? exec.agent : null
+    const state = agent !== null && agent.session !== undefined && agent.session !== null
+      ? sessionState(agent.session)
       : undefined
     return {
       endpoint: endpoint(),
-      project: projectFor(cwd),
+      project: projectFor(state === undefined ? undefined : state.cwd),
       agentId: agentId(),
       timeoutMs: settings.timeoutMs,
+      // D7: subagent sessions are read-only. The provider's gate is
+      // `agent_context == "primary"` (`__init__.py:328-330`).
+      writeEnabled: active() && settings.writeEnabled !== false && (state === undefined || state.primary !== false),
     }
   }
   if (active() && settings.toolsEnabled !== false) {
@@ -177,25 +181,40 @@ function apply (ctx, config = {}) {
   }
 
   // ── per-session state ───────────────────────────────────────────────────
-  // Scoped session ids this process has opened, so `on_session_end` can close
+  // Scoped session ids this process has opened, so the lifecycle hooks close
   // exactly the ones we started (Hermes: "for each matching scoped session").
+  // `closedSessions` remembers confirmed ends, so a session that is disposed
+  // and later resumed gets exactly one `session/end` per open.
   const startedSessions = new Set()
+  const closedSessions = new Set()
+  const closingSessions = new Set()
+  // `session/start` requests still awaiting their answer. Disposal waits for
+  // them before closing, or a session opened during shutdown would be missed.
+  const pendingStarts = new Set()
   const states = new WeakMap()
   function sessionState (session) {
     let state = states.get(session)
     if (state === undefined) {
+      const header = session !== null && session !== undefined
+        && session.header !== null && typeof session.header === 'object'
+        ? session.header
+        : {}
       state = {
         id: session !== null && session !== undefined && typeof session.id === 'string' ? session.id : '',
-        cwd: session !== null && session !== undefined && session.header !== undefined && typeof session.header.cwd === 'string'
-          ? session.header.cwd
-          : undefined,
-        started: false,
+        cwd: typeof header.cwd === 'string' ? header.cwd : undefined,
+        // D7: DSH marks subagent sessions with `meta.origin: 'subagent'`.
+        // The provider's equivalent gate is `agent_context == "primary"`.
+        primary: header.origin !== 'subagent',
+        // Scoped id confirmed by the server; empty until `session/start`
+        // succeeds and echoes it back (D9: a mismatch is never cached).
+        scoped: '',
+        starting: false,
         lastUserText: '',
         lastAssistantText: '',
         lastQuery: '',
         inFlight: false,
+        compressing: false,
         injected: new Set(),
-        idle: false,
       }
       states.set(session, state)
     }
@@ -207,35 +226,107 @@ function apply (ctx, config = {}) {
     timeoutMs: settings.timeoutMs,
   })
 
-  const startSession = async (state) => {
-    if (state.started || !active() || settings.writeEnabled === false) return
-    state.started = true
-    const resolvedAgent = agentId()
-    if (resolvedAgent === '') return
-    warnOnce()
-    const scoped = state.id === ''
-      ? ''
-      : identity.scopedSessionId({ home, prefix: settings.identityPrefix, agentId: resolvedAgent, sessionId: state.id })
-    const result = await callApi('session/start', {
-      sessionId: scoped,
-      project: projectFor(state.cwd),
-      cwd: state.cwd,
+  const scopedIdFor = (state, resolvedAgent = agentId()) => {
+    if (state.primary === false || state.id === '' || resolvedAgent === '') return ''
+    return identity.scopedSessionId({
+      home,
+      prefix: settings.identityPrefix,
       agentId: resolvedAgent,
-    }, state)
-    if (result.error !== undefined) {
-      state.started = false
-      logger.warn?.(`[${PLUGIN}] session/start failed: ${result.error}`)
-      return
+      sessionId: state.id,
+    })
+  }
+
+  // D9: a session/start answer that does not echo our scoped id is not used.
+  // Warn once per scoped id instead of once per retry; the session stays
+  // uncached and the next turn tries again, exactly like Hermes.
+  const warnSessionMismatch = (() => {
+    const warned = new Set()
+    return (scoped, returned) => {
+      if (warned.has(scoped)) return
+      warned.add(scoped)
+      logger.warn?.(`[${PLUGIN}] session/start did not confirm ${scoped} (returned ${returned === undefined ? 'no session' : returned}); it stays uncached`)
     }
-    if (scoped !== '') startedSessions.add(scoped)
-    const returned = result.session !== null && typeof result.session === 'object' ? result.session.id : undefined
-    if (typeof returned === 'string' && returned !== '' && returned !== scoped) {
-      logger.warn?.(`[${PLUGIN}] server returned a different session id (${returned}); writes may land in another bucket`)
+  })()
+
+  const startSession = async (state) => {
+    if (state.primary === false || !active() || settings.writeEnabled === false) return
+    if (state.scoped !== '' || state.starting) return
+    const resolvedAgent = agentId()
+    const scoped = scopedIdFor(state, resolvedAgent)
+    if (scoped === '') return
+    state.starting = true
+    let settle
+    const pending = new Promise((resolve) => { settle = resolve })
+    pendingStarts.add(pending)
+    try {
+      warnOnce()
+      const result = await callApi('session/start', {
+        sessionId: scoped,
+        project: projectFor(state.cwd),
+        cwd: state.cwd,
+        agentId: resolvedAgent,
+      }, state)
+      if (result.error !== undefined) {
+        logger.warn?.(`[${PLUGIN}] session/start failed: ${result.error}`)
+        return
+      }
+      // Hermes caches the scoped session only when the answer echoes it
+      // (`__init__.py:537-543`). A mismatch must never become the session we
+      // write under; the turn stays fail-open with the session uncached.
+      const returned = result.session !== null && typeof result.session === 'object' ? result.session.id : undefined
+      if (returned !== scoped) {
+        warnSessionMismatch(scoped, returned)
+        return
+      }
+      state.scoped = scoped
+      startedSessions.add(scoped)
+      closedSessions.delete(scoped)
+    } finally {
+      state.starting = false
+      pendingStarts.delete(pending)
+      settle()
     }
   }
 
+  const endScoped = async (scoped) => {
+    if (scoped === '' || settings.writeEnabled === false) return false
+    if (!startedSessions.has(scoped) || closedSessions.has(scoped) || closingSessions.has(scoped)) return false
+    const resolved = endpoint()
+    if (resolved.valid !== true) return false
+    closingSessions.add(scoped)
+    try {
+      const result = await http.api(resolved.base, 'session/end', { sessionId: scoped }, {
+        secret: resolved.secret,
+        timeoutMs: settings.timeoutMs,
+      })
+      if (result.error !== undefined) {
+        logger.warn?.(`[${PLUGIN}] session/end failed: ${result.error}`)
+        return false
+      }
+      // Hermes marks a session ended only after the server confirms it
+      // (`__init__.py:559-562`); a failed or unconfirmed close stays retryable.
+      if (result.success !== true) return false
+      closedSessions.add(scoped)
+      startedSessions.delete(scoped)
+      return true
+    } finally {
+      closingSessions.delete(scoped)
+    }
+  }
+
+  const endSessionState = async (state) => {
+    if (state === undefined || state === null || state.scoped === '') return false
+    const scoped = state.scoped
+    const ended = await endScoped(scoped)
+    // A closed session is reopened by `on_session_switch`; clearing the cached
+    // id is what lets `startSession` run again for the same scoped id.
+    if (state.scoped === scoped && (ended === true || closedSessions.has(scoped))) state.scoped = ''
+    return ended
+  }
+
   // ── turn sync ───────────────────────────────────────────────────────────
-  const observeTurn = async (state, session) => {
+  const observeTurn = async (state) => {
+    if (state.primary === false) return
     const user = state.lastUserText
     const assistant = state.lastAssistantText
     if (user === '' || assistant === '') return
@@ -327,27 +418,113 @@ function apply (ctx, config = {}) {
     }
   }
 
-  // ── session end ─────────────────────────────────────────────────────────
+  // ── pre-compress recall (on_pre_compress) ───────────────────────────────
   //
-  // Hermes' `on_session_end` fires "only at real session boundaries, never
-  // per-turn" and posts `session/end` for every scoped session it opened
-  // (`__init__.py:555`). DSH's session log has no session-end event (only
-  // `session/end-seed`), so the real boundary available to a host plugin is
-  // our own disposal — process shutdown or plugin unload. Nothing is sent
-  // per turn: an idle session keeps its provider record open.
-  const endSessions = async () => {
-    if (settings.writeEnabled === false) return
-    const resolved = endpoint()
-    if (resolved.valid !== true) return
-    const ids = [...startedSessions]
-    startedSessions.clear()
-    for (const sessionId of ids) {
-      const result = await http.api(resolved.base, 'session/end', { sessionId }, {
-        secret: resolved.secret,
+  // Hermes' `on_pre_compress(messages)` returns `prefetch(query)` and the host
+  // splices that text into the compaction summary prompt (`__init__.py:578`,
+  // `memory_manager.py:340`). DSH exposes the compaction only as durable,
+  // log-only session events: `compaction/start` is appended before
+  // summarization, and the sole related waterfall (`compaction/summary-error`)
+  // is for error recovery, not prompt contribution. The port therefore runs
+  // the same query selection and recall fetch and injects the fenced block via
+  // `agent.inject()`: the model gets the memory at/after compaction instead of
+  // inside the summary prompt.
+  const runPreCompress = async (session, state) => {
+    if (!active() || settings.prefetchEnabled === false || state.compressing) return
+    state.compressing = true
+    try {
+      const messages = typeof session.deriveMessages === 'function' ? session.deriveMessages() : []
+      const parts = []
+      for (const message of messages.slice(-5)) {
+        if (message === null || typeof message !== 'object') continue
+        const text = util.messageText(message)
+        if (typeof text === 'string' && text.trim() !== '') parts.push(text)
+      }
+      // Provider: " ".join(content of the last five messages), then the last
+      // 2000 characters (`__init__.py:579-580`).
+      const query = parts.join(' ').slice(-LIMITS.PREFETCH_QUERY_MAX_CHARS).trim()
+      if (query === '') return
+      const resolved = endpoint()
+      if (resolved.valid !== true) return
+      warnOnce()
+      const result = await prefetch.prefetchRecall({
+        endpoint: resolved,
+        project: projectFor(state.cwd),
+        agentId: agentId(),
+        query,
+        limit: settings.prefetchLimit,
         timeoutMs: settings.timeoutMs,
       })
-      if (result.error !== undefined) logger.warn?.(`[${PLUGIN}] session/end failed: ${result.error}`)
+      if (result.error !== undefined) {
+        logger.warn?.(`[${PLUGIN}] pre-compress recall failed: ${result.error}`)
+        return
+      }
+      const block = prefetch.buildMemoryContextBlock(result.text)
+      if (block !== '') injectRecall(session, state, block)
+    } catch (error) {
+      logger.warn?.(`[${PLUGIN}] pre-compress recall crashed: ${errorText(error)}`)
+    } finally {
+      state.compressing = false
     }
+  }
+
+  // ── lifecycle: on_session_end / on_session_switch ───────────────────────
+  //
+  // Hermes posts `session/end` for every scoped session it opened, only at real
+  // session boundaries (`__init__.py:555` and `:565`). DSH has no provider-level
+  // session-end event; the boundaries a host plugin sees are
+  //   * `session/disposed` — a session leaves the live store (`Session` docs),
+  //   * `agent/disposed`   — the agent's driver has shut down.
+  // Both close the scoped id idempotently, so whichever fires first performs
+  // the single `session/end`. `agent/created` is the `on_session_switch`
+  // equivalent: a resume/clear/compact lifecycle closes the previous scoped
+  // session (Hermes: `on_session_end([])`) before opening the new one.
+  ctx.effect(() => {
+    const warnLifecycle = (what) => (error) => {
+      logger.warn?.(`[${PLUGIN}] ${what} failed: ${errorText(error)}`)
+    }
+    const onSessionDisposed = (session) => {
+      try { void endSessionState(sessionState(session)) } catch (error) { warnLifecycle('session disposal')(error) }
+    }
+    const onAgentDisposed = (payload) => {
+      try {
+        const agent = payload !== null && typeof payload === 'object' ? payload.agent : undefined
+        const session = agent !== null && typeof agent === 'object' ? agent.session : undefined
+        if (session !== undefined && session !== null) void endSessionState(sessionState(session))
+      } catch (error) { warnLifecycle('agent disposal')(error) }
+    }
+    const onAgentCreated = (payload) => {
+      try {
+        const agent = payload !== null && typeof payload === 'object' ? payload.agent : undefined
+        const session = agent !== null && typeof agent === 'object' ? agent.session : undefined
+        if (session === undefined || session === null) return
+        const state = sessionState(session)
+        if (state.primary === false) return
+        const source = payload !== null && typeof payload === 'object' && typeof payload.source === 'string'
+          ? payload.source
+          : 'startup'
+        void (async () => {
+          if (source !== 'startup') await endSessionState(state)
+          await startSession(state)
+        })().catch(warnLifecycle('session switch'))
+      } catch (error) { warnLifecycle('agent creation')(error) }
+    }
+    const offSession = ctx.on('session/disposed', onSessionDisposed)
+    const offAgent = ctx.on('agent/disposed', onAgentDisposed)
+    const offCreated = ctx.on('agent/created', onAgentCreated)
+    return () => {
+      try { offSession() } catch { /* gone */ }
+      try { offAgent() } catch { /* gone */ }
+      try { offCreated() } catch { /* gone */ }
+    }
+  }, `${PLUGIN}: session lifecycle`)
+
+  const endSessions = async () => {
+    if (settings.writeEnabled === false) return
+    // Let an in-flight `session/start` land first: otherwise its session is
+    // opened after this loop read the set, and no `session/end` is ever sent.
+    if (pendingStarts.size > 0) await Promise.allSettled([...pendingStarts])
+    for (const scoped of [...startedSessions]) await endScoped(scoped)
   }
 
   // ── built-in memory mirror (on_memory_write) ────────────────────────────
@@ -396,6 +573,13 @@ function apply (ctx, config = {}) {
       try {
         if (event === null || typeof event !== 'object') return
         const state = sessionState(session)
+        if (event.type === 'compaction/start') {
+          // D5: the closest DSH expression of `on_pre_compress`. The event is
+          // appended before summarization, so recall is fetched while the
+          // compaction is being prepared.
+          void runPreCompress(session, state)
+          return
+        }
         if (event.type === 'user/message') {
           const message = event.data
           if (!util.isHumanMessage(message)) return
@@ -403,6 +587,14 @@ function apply (ctx, config = {}) {
           state.lastUserText = text
           state.lastAssistantText = ''
           state.injected.clear()
+          // on_turn_start bookkeeping (`__init__.py:352-355`) opens the scoped
+          // session at a turn boundary before any write. The other half of
+          // that hook (per-turn author ContextVar + queued-prefetch cache) has
+          // no DSH equivalent: DSH session meta exposes no author/platform and
+          // this port prefetches inline instead of queueing.
+          if (state.primary !== false && active() && settings.syncEnabled !== false && settings.writeEnabled !== false) {
+            void startSession(state)
+          }
           void runPrefetch(session, state, text)
           return
         }
@@ -420,11 +612,11 @@ function apply (ctx, config = {}) {
             state.lastAssistantText = ''
             return
           }
-          if (!active() || settings.syncEnabled === false || settings.writeEnabled === false) return
+          if (!active() || state.primary === false || settings.syncEnabled === false || settings.writeEnabled === false) return
           void (async () => {
             try {
               await startSession(state)
-              await observeTurn(state, session)
+              await observeTurn(state)
             } catch (error) {
               logger.warn?.(`[${PLUGIN}] sync crashed: ${errorText(error)}`)
             }

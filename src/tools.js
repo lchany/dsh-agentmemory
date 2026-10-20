@@ -180,6 +180,16 @@ function buildToolSet (options = {}) {
   const call = async (name, args, context) => {
     const built = buildRequest(name, args, context)
     if (built.error !== undefined) return fail(built.error)
+    // D7: the provider refuses writes outside the primary active session with
+    // this exact payload (`__init__.py:337-340`); the port applies the same
+    // gate to `memory_save` when a subagent asks for a write.
+    if (built.path === 'remember' && context.writeEnabled === false) {
+      return JSON.stringify({
+        success: false,
+        errorCode: 'read_only_context',
+        error: 'AgentMemory writes are disabled outside the primary active session.',
+      })
+    }
     const endpoint = context.endpoint || identity.resolveEndpoint({})
     if (endpoint.valid !== true) return fail('AgentMemory is not configured (invalid url).')
     const result = await http.api(endpoint.base, built.path, built.payload, {
